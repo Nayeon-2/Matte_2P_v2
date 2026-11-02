@@ -1,0 +1,23 @@
+# Unreal regenerates these
+/Binaries/
+/Intermediate/
+/Saved/
+/DerivedDataCache/
+.vs/
+*.sln
+*.VC.db
+*.opensdf
+*.sdf
+*.suo
+*.xcworkspace
+
+# Plugins: keep source and the built DLLs (opens without Visual Studio), skip debug symbols
+Plugins/*/Intermediate/
+Plugins/*/Binaries/**/*.pdb
+
+# Python cache from Tools/
+__pycache__/
+*.pyc
+
+# Tool caches
+graphify-out/
