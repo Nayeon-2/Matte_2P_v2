@@ -1,0 +1,239 @@
+// ===== Glitch A v27: 화면 밖 좌표가 반대편으로 넘어가 구석에 조각이 생기던 문제 수정 =====
+// 사용처: M_RVM_Composite 의 Custom 노드 "Glitch A" (Code 칸에 통째로 붙여넣기)
+// [핀] OutTex, BgTex, TgtTex (Texture Object), T (Time), UV (ViewportUV)
+//      Amount 전체 세기 / Wave 0 = 탁탁 튐, 1 = 부드러운 무빙 / Rate 패턴 속도 / Shift 줄 밀림 / Split 색수차 폭
+//      Glow 빛 밝기 / ColorA, ColorB 빛 색 / Bands 굵은 띠 수 / Fade 원래 자리 배경 어둡게 (0 권장)
+//      Coverage 켜지는 줄 비율 / Weird 사람 색 반전 정도 / Dark 글리치된 사람 어둡게 / ColW 세로 칸 폭 (0 = 끔)
+// I 키 = Python이 matte 좌상단 블록 6에 실어 보내는 0..1 켜짐 값 (--glitch-fade 초 동안 부드럽게 변함)
+#define GA_H(x)           frac(sin((x)) * 43758.5453)
+#define GA_HW(a, t)       lerp(GA_H((a) + floor(t) * 1.618), GA_H((a) + (floor(t) + 1.0) * 1.618), smoothstep(0.0, 1.0, frac(t)) * wv)
+#define GA_SW(e0, e1, x)  lerp(step(((e0) + (e1)) * 0.5, (x)), smoothstep((e0), (e1), (x)), wv)
+#define GA_LIN(c)         lerp(pow((max(c, 0.0) + 0.055) / 1.055, 2.4), max(c, 0.0) / 12.92, step(max(c, 0.0), 0.04045))
+#define GA_HUE(h)         saturate(abs(frac((h) + float3(1.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0)
+#define GA_SIG(s)         ((s).g > 0.9 && (s).r < 0.1 && (s).b < 0.1)
+#define GA_U16(k)         saturate((floor((k).r * 255.0 + 0.5) * 256.0 + floor((k).g * 255.0 + 0.5)) / 65535.0)
+#define GA_IN(u)          (step(0.0, (u).x) * step((u).x, 1.0) * step(0.0, (u).y) * step((u).y, 1.0))   // 화면 안 = 1, 밖 = 0
+
+// ---- 한 번 정하면 잘 안 바꾸는 값 ----
+int   UseKey     = 1;       // 1 = I 키로 켜고 끔, 0 = 키 무시 (항상 동작)
+float Blur       = 0.03;    // 꼬리(스트릭) 길이 (0 = 꼬리 없음)
+float OrderSpeed = 0.5;    // 켜지는 줄이 바뀌는 속도 (0 = 항상 같은 줄)
+float OnOffRows  = 7;     // 굵은 띠 하나를 몇 칸으로 나눠 켜고 끌지 (1 = 띠 통째, 8 = 가는 줄 단위)
+float RowSoft    = 0.5;    // 줄이 켜질 때 부드러운 정도 (클수록 서서히)
+float ColJag     = 0.3;     // 세로 칸 경계가 띠마다 들쭉날쭉한 정도 (0 = 곧은 세로선)
+int   WeirdMode  = 1;       // 0 = 완전 반전, 1 = 솔라리제이션, 2 = 보색(밝기 유지)
+float Thin       = 0.5;     // 가는 줄 비율 (0 = 굵은 띠 위주, 1 = 실선 위주)
+float Edge       = 1.5;     // 실루엣 테두리 색 빛 세기
+float Inner      = 3.0;     // 몸 안쪽 윤곽에서 색수차 빛이 나오는 정도 (0 = 실루엣 바깥만)
+float Rainbow    = 0.0;     // 빛 색: 0 = ColorA/B만, 1 = 무지개
+float Neon       = 0.6;     // 몸 안쪽 윤곽 네온 (0 = 끔)
+float Block      = 0.06;    // 블록 깨짐 확률 (0 = 끔)
+float Scan       = 0.15;    // 스캔라인 진하기 (사람과 빛에만)
+float Scatter    = 0.012;   // 가장자리 조각이 튀는 폭
+
+float wv = saturate(Wave); // 0 = 탁탁 튐, 1 = 부드러운 무빙
+
+// ---- 기본 합성 (효과 없는 원래 모습) ----
+float3 bgS   = max(Texture2DSample(BgTex, BgTexSampler, UV).rgb, 0.0);
+float3 bg    = GA_LIN(bgS);
+float4 p0    = Texture2DSample(OutTex, OutTexSampler, UV);
+float  a0    = smoothstep(0.4, 0.6, p0.a);
+float3 c0S   = p0.rgb;
+float3 col0  = GA_LIN(c0S);
+float3 plain = lerp(bg, col0, a0);
+
+// ---- I 키 신호: matte 블록 6 (x 24..27) R,G = 16비트 켜짐 값, 블록 1 = 초록 서명. 신호가 없으면 꺼짐 ----
+float keyOn = 1.0;
+if (UseKey > 0)
+{
+    keyOn = GA_SIG(OutTex.Load(int3(6, 2, 0))) ? GA_U16(OutTex.Load(int3(26, 2, 0))) : 0.0;
+}
+
+// ---- 전체 세기 = Amount × I 키 ----
+float env = saturate(Amount) * keyOn;
+if (env <= 0.001) return plain;
+
+// ---- 패턴 시간: 값은 칸 사이를 보간(Wave), 줄 나누기 구조는 천천히 바뀜 ----
+float tw1   = fmod(T * Rate, 4096.0);                             // 굵은 띠·꼬리 방향 (Rate 속도)
+float tw2   = tw1 * 2.0;                                          // 가는 줄·조각·블록 (2배)
+float tw4   = tw1 * 4.0;                                          // 잔떨림 (4배)
+float tickS = floor(tw1 / lerp(1.0, 8.0, wv));                    // 줄 두께 구성: Wave = 1 이면 8칸에 한 번만 바뀜
+
+// ---- 세로 칸: 칸마다 가로 줄 구성이 달라 줄이 칸 경계에서 끊기고 엇갈림 ----
+float yb   = UV.y * Bands;
+float bc   = floor(yb);
+float colI = 0.0;
+if (ColW > 0.0)
+{
+    float jag = (GA_H(bc * 21.7 + tickS * 3.9) - 0.5) * saturate(ColJag) * ColW;   // 띠마다 경계를 좌우로 흔듦
+    colI = floor((UV.x + jag) / ColW);
+}
+float bcC = bc + colI * 0.371;                                    // 칸마다 다른 띠 번호 → 모든 줄 난수가 칸마다 달라짐
+
+// ---- 줄마다 켜짐: 랜덤한 순서로 Coverage 비율까지 ----
+float rowS = floor(UV.y * Bands * max(OnOffRows, 1.0));
+float rnd  = frac(GA_H(rowS * 7.31 + colI * 3.71) + T * OrderSpeed);     // 켜지는 순서 (칸마다 다름)
+float lvl  = env * saturate(Coverage) * (1.0 + RowSoft);                 // 켜지는 비율 ≈ env × Coverage
+float amp  = smoothstep(rnd, rnd + RowSoft, lvl);
+if (amp <= 0.001) return plain;
+
+float4 tg = Texture2DSample(TgtTex, TgtTexSampler, UV);
+bg *= 1.0 - smoothstep(0.05, 0.4, tg.r) * saturate(Fade) * amp;
+float3 result = lerp(bg, col0, a0 * (1.0 - saturate(tg.r * 1.5)));      // 원래 타겟은 빼고 아래에서 다시 그림
+
+// ---- 가장자리 찾기 (화면 밖 좌표는 타겟 없음) ----
+float eMax = tg.r, eMin = tg.r;
+float2 taps[6] = { float2(Scatter, 0.0), float2(-Scatter, 0.0),
+                   float2(Scatter * 0.5, 0.0), float2(-Scatter * 0.5, 0.0),
+                   float2(0.0, Scatter * 0.6), float2(0.0, -Scatter * 0.6) };
+for (int q = 0; q < 6; q++)
+{
+    float2 uq = UV + taps[q];
+    float tq = Texture2DSampleLevel(TgtTex, TgtTexSampler, uq, 0).r * GA_IN(uq);
+    eMax = max(eMax, tq);
+    eMin = min(eMin, tq);
+}
+float edgeAmt = saturate((eMax - eMin) * 1.5);                    // 0 = 몸 안쪽/먼 배경, 1 = 경계 바로 근처
+
+// ---- 줄 구조: 굵은 띠마다 1~32등분 → 두께가 제각각인 줄 (세로 칸마다 다르게) ----
+float hB  = GA_HW(bcC * 78.233, tw1);                             // 굵은 띠 밀림 양
+float hB3 = GA_HW(bcC * 13.71 + 3.3, tw1);                        // 굵은 띠가 밀릴지
+float hB2 = GA_H(bcC * 39.346 + tickS * 7.137);                   // 띠 나누기 구조 (보간 안 함)
+float sub = exp2(floor(saturate(hB2 * (0.6 + Thin)) * 5.99));
+float row = bcC * 64.0 + floor(frac(yb) * sub);
+float hR  = GA_HW(row * 11.135, tw2);
+float hR2 = GA_HW(row * 63.726, tw2);
+float hR3 = GA_HW(row * 29.7,   tw2);
+float hR4 = GA_HW(row * 91.7,   tw4);
+
+// ---- 밀림: 대부분 조금, 가끔 아주 크게 (Wave면 새 위치로 미끄러짐) ----
+float cR  = (hR - 0.5) * 2.0;
+float dx  = cR * cR * cR * Shift * 2.0 * GA_SW(0.25, 0.45, hR2); // 줄의 65%만 밀림, Wave면 서서히 밀리고 돌아옴
+dx       += (hB - 0.5) * Shift * GA_SW(0.5, 0.7, hB3);           // 굵은 띠 통째 밀림
+dx       += (hR4 - 0.5) * 0.0015;                                  // 빠른 잔떨림 (약 2px)
+dx       *= amp;
+
+// ---- 가장자리 조각: 줄마다 조각 길이가 달라 격자가 안 보임 ----
+float cw   = 60.0 + 240.0 * GA_H(row * 29.7 + tickS * 4.3);      // 조각 길이는 구조와 함께 (미끄러지지 않게)
+float cell = floor(UV.x * cw);
+float cA   = GA_HW(cell * 12.9898 + row * 78.233, tw2);
+float cB   = GA_HW(cell * 39.346  + row * 11.135, tw2);
+float sdx  = (cA - 0.5) * 2.0 * Scatter * edgeAmt * amp;
+float kth  = 0.45 * edgeAmt * amp;
+float keepCell = GA_SW(kth - 0.1, kth + 0.1, cB);                 // Wave면 조각이 스며 사라짐
+
+// ---- 블록 깨짐: 타겟 실루엣 안에서만 블록째 밀림 ----
+float2 bq  = floor(UV * float2(32.0, 56.0));
+float  bs  = dot(bq, float2(12.9898, 78.233));
+float  hK  = GA_HW(bs, tw2);
+float  bth = 1.0 - Block * amp;
+float  blk = GA_SW(bth - 0.03, bth + 0.03, hK) * step(0.3, tg.r);
+dx        += blk * (GA_HW(bs * 1.37 + 9.1, tw2) - 0.5) * 0.15 * amp;
+
+// ---- 꼬리(스트릭): 가는 줄일수록 자주, Wave면 길이가 자라고 줄어듦 ----
+float sth      = 0.75 - 0.3 * saturate(Thin);
+float streakOn = GA_SW(sth - 0.1, sth + 0.1, GA_HW(row * 5.13, tw2));
+float dH       = GA_HW(row * 17.3, tw1);
+float dir      = lerp((dH < 0.5) ? -1.0 : 1.0, clamp((dH - 0.5) * 4.0, -1.0, 1.0), wv);   // 방향 전환도 부드럽게
+float L        = Blur * amp * streakOn * (0.2 + 0.8 * hR3 * hR3);
+
+const int N = 4;                                                  // 꼬리 샘플 수
+const int S = 3;                                                  // 한쪽 색 복사본 탭 수
+float3 lw   = float3(0.2126, 0.7152, 0.0722);
+
+// ---- 가운데: 사람 본체 (화면 밖 좌표는 사람 없음 → 반대편 사람이 구석에 안 생김) ----
+float  aC = 0.0;
+float3 cC = 0.0;
+[loop] for (int j = 0; j < N; j++)
+{
+    if (j > 0 && L <= 0.0) break;
+    float  t   = (float)j / (N - 1);
+    float2 uvk = float2(UV.x + dx + sdx - dir * t * L, UV.y);
+    float4 sm  = Texture2DSampleLevel(OutTex, OutTexSampler, uvk, 0);
+    float  a   = smoothstep(0.4, 0.6, sm.a) * Texture2DSampleLevel(TgtTex, TgtTexSampler, uvk, 0).r * (1.0 - t * 0.6) * GA_IN(uvk);   // 타겟 사람만
+    if (a > aC) { aC = a; cC = sm.rgb; }
+}
+cC = GA_LIN(cC);
+float lC = dot(cC, lw);
+
+// ---- 양옆: ColorA / ColorB 빛 복사본 (사람 밖으로 삐져나오거나 안쪽 윤곽이 어긋난 곳에서만 빛남) ----
+float3 eA = saturate(ColorA.rgb);
+eA /= max(max(max(eA.r, eA.g), eA.b), 0.001);                     // 밝기 무시, 색조만
+float3 eB = saturate(ColorB.rgb);
+eB /= max(max(max(eB.r, eB.g), eB.b), 0.001);
+float  spread = (Split * (0.5 + 1.5 * hR2 * hR2) + 0.002) * sqrt(amp);   // 줄마다 갈라짐 폭이 다름, 켜질 때 테두리부터 먼저
+float  fA = 0.0, fB = 0.0;
+float3 lA = 0.0, lB = 0.0;
+[loop] for (int k = 1; k <= S; k++)
+{
+    float  side = (float)k / S;                                   // 가운데에서 멀어질수록 1
+    float  ox   = side * spread;
+    float  aa = 0.0, ab = 0.0;
+    float3 ca = 0.0, cb = 0.0;
+    [loop] for (int j2 = 0; j2 < N; j2++)
+    {
+        if (j2 > 0 && L <= 0.0) break;
+        float  t    = (float)j2 / (N - 1);
+        float  fall = 1.0 - t * 0.6;
+        float  bx   = UV.x + dx + sdx - dir * t * L;
+        float2 u1   = float2(bx - ox, UV.y);
+        float2 u2   = float2(bx + ox, UV.y);
+        float4 s1   = Texture2DSampleLevel(OutTex, OutTexSampler, u1, 0);
+        float4 s2   = Texture2DSampleLevel(OutTex, OutTexSampler, u2, 0);
+        float  a1   = smoothstep(0.4, 0.6, s1.a) * Texture2DSampleLevel(TgtTex, TgtTexSampler, u1, 0).r * fall * GA_IN(u1);
+        float  a2   = smoothstep(0.4, 0.6, s2.a) * Texture2DSampleLevel(TgtTex, TgtTexSampler, u2, 0).r * fall * GA_IN(u2);
+        if (a1 > aa) { aa = a1; ca = s1.rgb; }
+        if (a2 > ab) { ab = a2; cb = s2.rgb; }
+    }
+    float inA = max(dot(GA_LIN(ca), lw) - lC, 0.0) * Inner;       // 안쪽 윤곽: 어긋난 복사본이 더 밝은 곳
+    float inB = max(dot(GA_LIN(cb), lw) - lC, 0.0) * Inner;
+    float ffA = aa * saturate(1.0 - aC + inA);
+    float ffB = ab * saturate(1.0 - aC + inB);
+    float3 tA = lerp(eA, GA_HUE((1.0 - side) * 0.33), saturate(Rainbow));     // 무지개: 초록 → 빨강
+    float3 tB = lerp(eB, GA_HUE(0.33 + side * 0.47), saturate(Rainbow));      // 무지개: 초록 → 보라
+    fA = max(fA, ffA); lA = max(lA, tA * ffA);                    // 평균 대신 최댓값: 바깥 테두리도 꽉 찬 빛
+    fB = max(fB, ffB); lB = max(lB, tB * ffB);
+}
+
+// ---- 사람 색: 반전 계열로 바꾸고 어둡게 (줄 세기만큼) ----
+float3 cs = pow(saturate(cC), 1.0 / 2.2);                        // 화면 감마 기준으로 계산
+float3 inv;
+if (WeirdMode == 0)      inv = 1.0 - cs;                                       // 완전 반전
+else if (WeirdMode == 1) inv = lerp(cs, 1.0 - cs, step(0.5, cs));              // 솔라리제이션: 밝은 부분만 반전
+else                   { inv = 1.0 - cs; inv += dot(cs - inv, lw); }           // 보색, 밝기 유지
+cs = lerp(cs, saturate(inv), saturate(Weird) * amp);
+cC = pow(cs, 2.2);
+cC *= 1.0 - saturate(Dark) * amp;
+
+// ---- 몸 안쪽 윤곽 네온: 밝기 기울기가 큰 곳 (레퍼런스의 얼굴·근육 형광선) ----
+float2 uvM = float2(UV.x + dx + sdx, UV.y);
+float  px  = 0.0015;
+float  gx  = dot(Texture2DSampleLevel(OutTex, OutTexSampler, uvM + float2(px, 0.0), 0).rgb
+               - Texture2DSampleLevel(OutTex, OutTexSampler, uvM - float2(px, 0.0), 0).rgb, lw);
+float  gy  = dot(Texture2DSampleLevel(OutTex, OutTexSampler, uvM + float2(0.0, px * 1.78), 0).rgb
+               - Texture2DSampleLevel(OutTex, OutTexSampler, uvM - float2(0.0, px * 1.78), 0).rgb, lw);
+float  nE  = saturate(length(float2(gx, gy)) * 6.0) * aC * amp;
+float3 neonCol = GA_HUE(hR3 + frac(T * 0.1));
+neonCol = lerp(neonCol, lerp(ColorA.rgb, ColorB.rgb, smoothstep(0.4, 0.6, hR)), 0.5);
+
+// ---- 합성: 사람 본체 + 가산 빛 (A와 B가 겹치면 흰색), 밝기는 Glow / 스캔라인은 사람과 빛에만 ----
+float  scan  = 1.0 - saturate(Scan) * amp * (0.5 + 0.5 * sin(UV.y * 1600.0));
+float  glowK = saturate(Glow) * 3.0;
+float  aP    = aC * keepCell;
+float3 g     = result * (1.0 - aP) + cC * scan * aP;             // 배경(result)에는 스캔라인 없음
+float  both  = min(fA, fB);
+float3 light = lA + lB + both * saturate(1.0 - eA - eB);          // 겹친 곳은 부족한 채널을 채워 흰색
+g += light * glowK * Edge * scan * amp;                           // 빛은 조각 지움(keepCell) 영향 없음
+g += neonCol * nE * Neon * (1.0 + glowK) * scan * keepCell;
+g  = lerp(g, g.brg, blk * 0.7 * aP);                              // 깨진 블록은 사람 픽셀만 채널이 뒤섞임
+
+// ---- 이음새 없는 꺼짐: 줄 세기가 0에 가까우면 원본과 똑같이 ----
+return lerp(plain, g, saturate(amp * 3.0));
+#undef GA_H
+#undef GA_HW
+#undef GA_SW
+#undef GA_LIN
+#undef GA_HUE
+#undef GA_SIG
+#undef GA_U16
+#undef GA_IN
